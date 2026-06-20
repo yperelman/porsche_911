@@ -2,16 +2,23 @@ package com.ebay.challenge.streamprocessor.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaProducerFactory;
+import org.springframework.kafka.core.KafkaAdmin;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
 import org.springframework.kafka.listener.ContainerProperties;
-import org.springframework.scheduling.annotation.EnableScheduling;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -26,7 +33,6 @@ import java.util.Map;
  * - Enable idempotence through consumer configuration
  */
 @Configuration
-@EnableScheduling
 public class KafkaConsumerConfig {
 
     @Value("${kafka.bootstrap-servers:localhost:29092}")
@@ -38,11 +44,71 @@ public class KafkaConsumerConfig {
     @Value("${kafka.consumer.concurrency:3}")
     private int concurrency;
 
+    @Value("${watermark.idle-timeout-seconds:60}")
+    private long idleTimeoutSeconds;
+
     @Bean
     public ObjectMapper objectMapper() {
         ObjectMapper mapper = new ObjectMapper();
         mapper.registerModule(new JavaTimeModule());
+        // Serialize Instants as ISO-8601 strings (rather than epoch numbers) — used
+        // both by the Kafka consumer (when parsing input) and by the dashboard JSON
+        // controller (so timestamps render nicely in the browser).
+        mapper.disable(com.fasterxml.jackson.databind.SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
         return mapper;
+    }
+
+    /**
+     * KafkaAdmin auto-applies the {@link NewTopic} beans below at startup,
+     * creating topics with partition counts equal to {@code kafka.consumer.concurrency}
+     * so the per-partition concurrency story is demonstrable end-to-end (not silently
+     * undercut by a default 1-partition topic from broker auto-create). Binding both to
+     * the same property keeps {@link TopicTopologyValidator}'s actual-vs-expected check
+     * consistent by construction.
+     */
+    @Bean
+    public KafkaAdmin kafkaAdmin() {
+        Map<String, Object> config = new HashMap<>();
+        config.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        return new KafkaAdmin(config);
+    }
+
+    @Bean
+    public NewTopic adClicksTopic(@Value("${kafka.topics.ad-clicks:ad_clicks}") String name) {
+        return new NewTopic(name, concurrency, (short) 1);
+    }
+
+    @Bean
+    public NewTopic pageViewsTopic(@Value("${kafka.topics.page-views:page_views}") String name) {
+        return new NewTopic(name, concurrency, (short) 1);
+    }
+
+    /** Dead-letter topic for events that arrived past the allowed-lateness fence. */
+    @Bean
+    public NewTopic deadLetterTopic(@Value("${kafka.topics.dead-letter:dead_letter}") String name) {
+        return new NewTopic(name, concurrency, (short) 1);
+    }
+
+    /**
+     * Producer factory for the dead-letter publisher. acks=all + idempotence so
+     * that send().get() returning ack is a true durability barrier — and that
+     * intermittent broker hiccups don't produce duplicate dead-letter envelopes.
+     */
+    @Bean
+    public ProducerFactory<String, String> deadLetterProducerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        props.put(ProducerConfig.RETRIES_CONFIG, 5);
+        return new DefaultKafkaProducerFactory<>(props);
+    }
+
+    @Bean
+    public KafkaTemplate<String, String> deadLetterKafkaTemplate(ProducerFactory<String, String> deadLetterProducerFactory) {
+        return new KafkaTemplate<>(deadLetterProducerFactory);
     }
 
     /**
@@ -106,6 +172,7 @@ public class KafkaConsumerConfig {
 
         // Preserve partition ordering within each partition
         factory.getContainerProperties().setMissingTopicsFatal(false);
+        factory.getContainerProperties().setIdlePartitionEventInterval(idleTimeoutSeconds * 1000L);
 
         return factory;
     }
@@ -137,6 +204,7 @@ public class KafkaConsumerConfig {
 
         // Preserve partition ordering within each partition
         factory.getContainerProperties().setMissingTopicsFatal(false);
+        factory.getContainerProperties().setIdlePartitionEventInterval(idleTimeoutSeconds * 1000L);
 
         return factory;
     }
