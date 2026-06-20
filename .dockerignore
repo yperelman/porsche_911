@@ -1,0 +1,8 @@
+target/
+logs/
+.git/
+.idea/
+*.iml
+.venv/
+__pycache__/
+*.pyc

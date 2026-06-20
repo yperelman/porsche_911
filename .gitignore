@@ -1,0 +1,36 @@
+# --- Java / Maven build output ---
+target/
+*.class
+*.jar
+*.war
+*.ear
+*.log
+
+# --- Application runtime artifacts ---
+logs/
+.smoke-test/
+
+# --- Python helpers (data_generator.py, smoke tests) ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- IDE (project-shared .idea files and .run/ configs stay tracked) ---
+.idea/workspace.xml
+.idea/shelf/
+.idea/dataSources/
+.idea/dataSources.local.xml
+*.iml
+
+# --- OS noise ---
+.DS_Store
+Thumbs.db
+id_ed25519*
