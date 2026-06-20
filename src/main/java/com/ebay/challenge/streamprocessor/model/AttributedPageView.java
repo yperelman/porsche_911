@@ -36,4 +36,8 @@ public class AttributedPageView {
 
     @JsonProperty("attributed_click_id")
     private String attributedClickId;
+
+    @JsonProperty("attributed_click_time")
+    @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss", timezone = "UTC")
+    private Instant attributedClickTime;
 }
