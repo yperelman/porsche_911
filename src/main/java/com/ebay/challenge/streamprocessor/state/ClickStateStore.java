@@ -1,88 +1,149 @@
 package com.ebay.challenge.streamprocessor.state;
 
 import com.ebay.challenge.streamprocessor.model.AdClickEvent;
-import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Stores ad click events partitioned by user_id for efficient windowed joins.
- *
- * Thread-safe implementation with per-user locking for fine-grained concurrency.
- * Implements state eviction to prevent unbounded memory growth.
- *
- * TODO: Implement thread-safe state storage and retrieval
+ * Per-user store of ad click events, keyed by (eventTime, clickId) to dedup
+ * duplicate clicks and allow ties at the same event time. Thread-safe by
+ * composition: ConcurrentHashMap for the per-user index, ConcurrentSkipListMap
+ * for the in-window-sorted clicks. No global lock.
  */
-@Slf4j
 @Component
 public class ClickStateStore {
 
-    // Attribution window: clicks within last 30 minutes can be attributed
-    private static final Duration ATTRIBUTION_WINDOW = Duration.ofMinutes(30);
+    private final Duration attributionWindow;
 
-    // TODO: Add data structures to store clicks per user
-    // Hint: Consider /home/yuval/Downloads/porsche_911using ConcurrentHashMap and TreeSet for thread-safe, sorted storage
+    @Autowired
+    public ClickStateStore(@Value("${attribution.window-minutes:30}") long attributionWindowMinutes) {
+        this.attributionWindow = Duration.ofMinutes(attributionWindowMinutes);
+    }
 
-    /**
-     * Add a click event to the state store.
-     *
-     * TODO: Implement thread-safe click storage
-     * - Use locks for thread safety
-     * - Store clicks sorted by event time (most recent first)
-     * - Handle concurrent access properly
-     *
-     * @param click the ad click event
-     */
-    public void addClick(AdClickEvent click) {
-        // TODO: Implement this method
-        log.debug("Adding click {} for user {}", click.getClickId(), click.getUserId());
+    //used for correct dedup and deterministic results in case of 2 very close clicks
+    record ClickKey(Instant eventTime, String clickId) implements Comparable<ClickKey> {
+        @Override
+        public int compareTo(ClickKey other) {
+            int byTime = eventTime.compareTo(other.eventTime);
+            return byTime != 0 ? byTime : clickId.compareTo(other.clickId);
+        }
+    }
+
+    private final Map<String, ConcurrentSkipListMap<ClickKey, AdClickEvent>> clicksByUser = new ConcurrentHashMap<>();
+    private final Map<Integer, AtomicLong> clickCountByPartition = new ConcurrentHashMap<>();
+
+    public boolean addClick(AdClickEvent click) {
+        AdClickEvent previous = clicksByUser
+                .computeIfAbsent(click.getUserId(), u -> new ConcurrentSkipListMap<>())
+                .putIfAbsent(new ClickKey(click.getEventTime(), click.getClickId()), click);
+        boolean added = previous == null;
+        if (added) {
+            clickCountByPartition
+                    .computeIfAbsent(click.getPartition(), p -> new AtomicLong())
+                    .incrementAndGet();
+        }
+        return added;
     }
 
     /**
-     * Find the most recent click for a user within the attribution window.
-     *
-     * TODO: Implement attribution logic
-     * - Search for clicks in window: [pageViewTime - 30 minutes, pageViewTime]
-     * - Return the most recent click within the window
-     * - Return null if no click found
-     *
-     * @param userId the user ID
-     * @param pageViewTime the page view event time
-     * @return the most recent click within 30 minutes before the page view, or null if none found
+     * Returns whether {@code click} is a duplicate logical click delivered from a
+     * different Kafka source offset than the retained state entry. A retry of the
+     * retained source offset returns false and must remain uncommitted until eviction;
+     * a duplicate from another offset returns true and may become done once its
+     * idempotent correction has been flushed.
      */
+    public boolean isDuplicateFromDifferentSourceOffset(AdClickEvent click) {
+        ConcurrentSkipListMap<ClickKey, AdClickEvent> userClicks = clicksByUser.get(click.getUserId());
+        if (userClicks == null) {
+            return false;
+        }
+        AdClickEvent retained = userClicks.get(new ClickKey(click.getEventTime(), click.getClickId()));
+        return retained != null
+                && (retained.getPartition() != click.getPartition()
+                        || retained.getOffset() != click.getOffset());
+    }
+
     public AdClickEvent findAttributableClick(String userId, Instant pageViewTime) {
-        // TODO: Implement this method
-        log.debug("Finding attributable click for user {} at time {}", userId, pageViewTime);
-        return null;
+        ConcurrentSkipListMap<ClickKey, AdClickEvent> userClicks = clicksByUser.get(userId);
+        if (userClicks == null) {
+            return null;
+        }
+        // lowerEntry((pageViewTime + 1ns, "")) returns the greatest composite key strictly less
+        // than (pageViewTime+1ns, ""). Every real (eventTime, clickId) with eventTime ≤ pageViewTime
+        // qualifies; every entry with eventTime > pageViewTime does not. This is the sentinel-free
+        // way to include clicks whose eventTime exactly equals pageViewTime (a low/empty clickId
+        // on the search key would otherwise exclude them via the composite comparator).
+        Map.Entry<ClickKey, AdClickEvent> latest = userClicks.lowerEntry(new ClickKey(pageViewTime.plusNanos(1), ""));
+        if (latest == null) {
+            return null;
+        }
+        Instant windowStart = pageViewTime.minus(attributionWindow);
+        if (latest.getKey().eventTime().isBefore(windowStart)) {
+            return null;
+        }
+        return latest.getValue();
     }
 
     /**
-     * Evict old clicks that are beyond the retention window.
-     * Prevents unbounded memory growth.
+     * Evict clicks older than {@code cutoffTime}, but only for users whose clicks
+     * live on {@code partition}. A user's clicks are always on a single Kafka
+     * partition (because Kafka partitions by {@code user_id}), so checking one
+     * click suffices to know the user's partition.
      *
-     * TODO: Implement state eviction
-     * - Remove clicks older than the cutoff time
-     * - Clean up empty user entries
-     * - Return count of evicted clicks
-     *
-     * @param cutoffTime clicks older than this time should be evicted
-     * @return number of clicks evicted
+     * <p>This is the call the JoinEngine should use: it ensures that a fast
+     * partition's joined-watermark advance does not silently evict clicks for
+     * users on slower partitions and break their attribution.
      */
-    public int evictOldClicks(Instant cutoffTime) {
-        // TODO: Implement this method
-        log.debug("Evicting clicks older than {}", cutoffTime);
-        return 0;
+    public List<AdClickEvent> evictOldClicks(int partition, Instant cutoffTime) {
+        List<AdClickEvent> evicted = new ArrayList<>();
+        ClickKey boundary = new ClickKey(cutoffTime, "");
+        var userIter = clicksByUser.entrySet().iterator();
+        while (userIter.hasNext()) {
+            var userEntry = userIter.next();
+            var userClicks = userEntry.getValue();
+            // A user's clicks are all on the same partition (Kafka hashes by user_id),
+            // so a single sample tells us which partition this user belongs to.
+            var firstEntry = userClicks.firstEntry();
+            if (firstEntry == null || firstEntry.getValue().getPartition() != partition) {
+                continue;
+            }
+            var head = userClicks.headMap(boundary, false);
+            List<AdClickEvent> removed = new ArrayList<>(head.values());
+            evicted.addAll(removed);
+            decrementPartitionCounts(removed);
+            head.clear();
+            if (userClicks.isEmpty()) {
+                userIter.remove();
+            }
+        }
+        return evicted;
     }
 
-    /**
-     * Get the total number of clicks currently in state.
-     *
-     * @return total click count across all users
-     */
     public long getTotalClickCount() {
-        // TODO: Implement this method
-        return 0;
+        return clickCountByPartition.values().stream().mapToLong(AtomicLong::get).sum();
+    }
+
+    public long getClickCount(int partition) {
+        AtomicLong count = clickCountByPartition.get(partition);
+        return count == null ? 0 : count.get();
+    }
+
+    private void decrementPartitionCounts(List<AdClickEvent> removed) {
+        for (AdClickEvent click : removed) {
+            AtomicLong count = clickCountByPartition.get(click.getPartition());
+            if (count != null) {
+                count.decrementAndGet();
+            }
+        }
     }
 }
