@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>eBay · Attribution pipeline</title>
+    <style>
+        * { box-sizing: border-box; }
+        :root {
+            /* eBay dark theme. The brand palette (red/blue/yellow/green) doubles
+               as the pipeline state colors, so branding and meaning align. */
+            --bg: #0f1112;
+            --panel: #1b1d1f;
+            --panel-2: #24272a;
+            --line: #34383c;
+            --ink: #f5f5f5;
+            --muted: #9ba2a9;
+            --ok:   #9bd028;   /* eBay green  → attributed / healthy */
+            --bad:  #fa6165;   /* eBay red    → dead-letter / dropped / paused */
+            --warn: #f5af02;   /* eBay yellow → duplicate / no-attribution */
+            --idle: #6b7480;   /* pending / unknown */
+            --accent: #3b87f0; /* eBay blue   → LIVE + flow */
+            --grid: rgba(59,135,240,0.04);
+            --sans: "Market Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        }
+        /* Light theme — classic eBay white surfaces. Brand hues are darkened
+           where needed to stay legible against white. */
+        :root[data-theme="light"] {
+            --bg: #f7f7f7;
+            --panel: #ffffff;
+            --panel-2: #f1f3f5;
+            --line: #e3e6ea;
+            --ink: #16191c;
+            --muted: #707880;
+            --ok:   #4f8a00;
+            --bad:  #e53238;
+            --warn: #a8730a;
+            --idle: #8a9099;
+            --accent: #0064d2;
+            --grid: rgba(0,100,210,0.05);
+        }
+        html, body { background: var(--bg); }
+        body {
+            font-family: var(--sans);
+            color: var(--ink);
+            margin: 0;
+            /* Faint scanline-grid wash — instrument panel, kept very low contrast. */
+            background-image:
+                linear-gradient(var(--grid) 1px, transparent 1px),
+                linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+            background-size: 100% 40px, 40px 100%;
+        }
+        .shell { max-width: 1320px; margin: 0 auto; padding: 0 22px 40px; }
+
+        /* ---- status bar --------------------------------------------------- */
+        .statusbar {
+            position: sticky; top: 0; z-index: 20;
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            align-items: center;
+            gap: 18px;
+            padding: 16px 0 14px;
+            margin-bottom: 22px;
+            border-bottom: 1px solid var(--line);
+            background: linear-gradient(180deg, var(--bg) 70%, rgba(11,15,20,0));
+            transition: border-color .25s ease;
+        }
+        .brand { display: flex; align-items: baseline; gap: 10px; white-space: nowrap; }
+        .ebay { font-style: italic; font-weight: 800; font-size: 27px; letter-spacing: -1.5px; line-height: 1; }
+        /* eBay logo colors are fixed regardless of theme. */
+        .ebay span:nth-child(1) { color: #e53238; }
+        .ebay span:nth-child(2) { color: #0064d2; }
+        .ebay span:nth-child(3) { color: #f5af02; }
+        .ebay span:nth-child(4) { color: #86b817; }
+        .brand-product { font-size: 13px; font-weight: 600; color: var(--muted); letter-spacing: .01em; }
+        .subtitle {
+            font-family: var(--sans);
+            font-size: 12px;
+            color: var(--muted);
+            letter-spacing: .04em;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .status-right {
+            display: flex; align-items: center; gap: 16px;
+            font-family: var(--sans); font-size: 12px; color: var(--muted);
+            white-space: nowrap;
+        }
+        .theme-toggle {
+            font-family: var(--sans); font-size: 12px; letter-spacing: .04em;
+            color: var(--muted); background: var(--panel-2);
+            border: 1px solid var(--line); border-radius: 7px;
+            padding: 5px 10px; cursor: pointer; line-height: 1;
+            display: inline-flex; align-items: center; gap: 6px;
+            transition: color .15s ease, border-color .15s ease;
+        }
+        .theme-toggle:hover { color: var(--ink); border-color: var(--accent); }
+        .theme-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+        .theme-toggle .glyph { font-size: 13px; }
+        .parts { display: flex; gap: 5px; align-items: center; }
+        .parts .pdot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--idle);
+            box-shadow: 0 0 0 0 transparent;
+        }
+        .parts .pdot.live { background: var(--ok); box-shadow: 0 0 8px rgba(134,184,23,.55); }
+        .parts .pdot.warn { background: var(--warn); }
+        .parts .pdot.bad  { background: var(--bad); }
+        .live-flag { display: inline-flex; align-items: center; gap: 7px; color: var(--ink); }
+        .live-flag .beacon {
+            width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+            animation: beat 1.6s ease-in-out infinite;
+        }
+        @keyframes beat {
+            0%, 100% { opacity: .35; transform: scale(.8); }
+            50%      { opacity: 1;   transform: scale(1.15); box-shadow: 0 0 10px var(--accent); }
+        }
+        /* Paused alert state spreads across the whole bar. */
+        body.paused .statusbar { border-bottom-color: var(--bad); }
+        body.paused .live-flag .beacon { background: var(--bad); animation: none; box-shadow: 0 0 10px var(--bad); }
+        body.paused .live-flag { color: var(--bad); }
+
+        .alert {
+            display: none;
+            font-family: var(--sans); font-weight: 700; font-size: 13px;
+            letter-spacing: .08em; text-transform: uppercase;
+            color: var(--bad);
+            border: 1px solid var(--bad);
+            background: rgba(255,92,92,0.08);
+            border-radius: 8px;
+            padding: 11px 16px;
+            margin-bottom: 22px;
+            align-items: center; gap: 10px;
+        }
+        body.paused #sink-alert { display: flex; }
+        body.stranded #skew-alert { display: flex; }
+        .alert .sq { width: 9px; height: 9px; background: var(--bad); border-radius: 2px; }
+        /* Watermark-skew advisory reads as a sentence, so drop the all-caps. */
+        .alert.skew {
+            color: var(--warn); border-color: var(--warn);
+            background: rgba(245,176,66,0.08);
+            text-transform: none; letter-spacing: .01em; font-weight: 600; font-size: 12px;
+        }
+        .alert.skew .sq { background: var(--warn); }
+
+        /* ---- panels & headers -------------------------------------------- */
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 18px;
+        }
+        .eyebrow {
+            font-family: var(--sans);
+            font-size: 11px;
+            letter-spacing: .18em;
+            text-transform: uppercase;
+            color: var(--muted);
+            margin: 0 0 14px;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .eyebrow[title] { cursor: help; }
+        .eyebrow:before { content: ""; width: 14px; height: 1px; background: var(--accent); display: inline-block; }
+
+        /* ---- hero: attribution funnel (signature) ------------------------ */
+        .hero { margin-bottom: 22px; }
+        .funnel {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr auto 1fr;
+            align-items: stretch;
+            gap: 4px;
+        }
+        .stage { padding: 6px 10px; }
+        .stage .label {
+            font-family: var(--sans); font-size: 11px; letter-spacing: .14em;
+            text-transform: uppercase; color: var(--muted); margin-bottom: 8px;
+        }
+        .stage .num {
+            font-family: var(--sans); font-weight: 700;
+            font-size: clamp(30px, 5vw, 52px); line-height: .95;
+            letter-spacing: -1.5px; font-variant-numeric: tabular-nums;
+        }
+        .stage.attributed .num { color: var(--ok); }
+        .stage.dead .num { color: var(--bad); }
+        .stage .sub { font-family: var(--sans); font-size: 11px; color: var(--muted); margin-top: 7px; }
+        .num.flash { animation: flash .8s ease-out; }
+        @keyframes flash { 0% { color: var(--accent); } 100% {} }
+
+        .chev { display: flex; align-items: center; justify-content: center; gap: 3px; color: var(--idle); }
+        .chev span {
+            font-family: var(--sans); font-size: 18px; line-height: 1;
+            animation: drift 1.8s linear infinite;
+        }
+        .chev span:nth-child(2) { animation-delay: .25s; }
+        .chev span:nth-child(3) { animation-delay: .5s; }
+        @keyframes drift { 0% { opacity: .15; } 40% { opacity: 1; color: var(--accent); } 100% { opacity: .15; } }
+        body.paused .chev span { animation: none; opacity: .5; color: var(--bad); }
+
+        .hero-foot {
+            display: grid;
+            grid-template-columns: 1.3fr 1fr 1fr;
+            gap: 18px;
+            align-items: end;
+            margin-top: 20px;
+            padding-top: 18px;
+            border-top: 1px solid var(--line);
+        }
+        .rate-block .rate-num {
+            font-family: var(--sans); font-weight: 700; font-size: 38px;
+            letter-spacing: -1px; color: var(--accent); font-variant-numeric: tabular-nums;
+        }
+        .rate-block .label, .ministat .label {
+            font-family: var(--sans); font-size: 11px; letter-spacing: .14em;
+            text-transform: uppercase; color: var(--muted); margin-bottom: 6px;
+        }
+        #sparkline { width: 100%; height: 46px; display: block; margin-top: 6px; }
+        .ministat .v {
+            font-family: var(--sans); font-weight: 700; font-size: 24px;
+            letter-spacing: -.5px; font-variant-numeric: tabular-nums;
+        }
+
+        /* ---- partition rail ---------------------------------------------- */
+        .rail { margin-bottom: 22px; }
+        .part-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+        .part {
+            border: 1px solid var(--line); border-radius: 10px;
+            background: var(--panel-2); padding: 14px;
+        }
+        .part .pid {
+            font-family: var(--sans); font-size: 12px; letter-spacing: .1em;
+            color: var(--muted); display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 10px;
+        }
+        .part .pid b { color: var(--ink); }
+        .part .lagval { font-family: var(--sans); font-weight: 700; font-size: 26px; letter-spacing: -.5px; font-variant-numeric: tabular-nums; }
+        .lagbar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 9px 0 12px; }
+        .lagbar > i { display: block; height: 100%; width: 0; border-radius: 3px; transition: width .4s ease, background .4s ease; }
+        .part .meta { font-family: var(--sans); font-size: 11px; color: var(--muted); display: grid; gap: 4px; }
+        .part .meta span b { color: var(--ink); font-weight: 700; }
+        .sev-ok > i { background: var(--ok); }
+        .sev-warn > i { background: var(--warn); }
+        .sev-bad > i { background: var(--bad); }
+        .sev-idle > i { background: var(--idle); }
+        .sev-ahead > i { background: var(--bad); }
+        /* Stranded partition: joined watermark sits ahead of wall-clock. */
+        .part.stranded { border-color: var(--bad); box-shadow: inset 0 0 0 1px rgba(255,92,92,.45); }
+        .lagval.ahead { color: var(--bad); }
+        .part .skewnote { font-family: var(--sans); font-size: 10px; color: var(--bad); margin-top: 9px; letter-spacing: .03em; line-height: 1.3; }
+        #global-lag.crit { color: var(--bad); font-weight: 700; }
+
+        /* ---- two columns: feed + timeline -------------------------------- */
+        .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+        .scroll { max-height: 420px; overflow-y: auto; margin: 0 -4px; }
+        table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+        thead th {
+            position: sticky; top: 0;
+            font-family: var(--sans); font-weight: 700; font-size: 10px;
+            letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+            text-align: left; padding: 8px 10px;
+            background: var(--panel); border-bottom: 1px solid var(--line);
+        }
+        tbody td { padding: 9px 10px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+        tbody td.mono, table.mono td { font-family: var(--sans); }
+        tbody tr:last-child td { border-bottom: 0; }
+        .row { cursor: pointer; transition: background .12s ease; }
+        .row:hover td, .row:focus-visible td { background: var(--panel-2); }
+        .row:focus-visible { outline: none; }
+        .row:focus-visible td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+        .type-tag {
+            font-family: var(--sans); font-size: 11px; letter-spacing: .04em;
+            padding: 2px 7px; border-radius: 5px; border: 1px solid var(--line);
+            color: var(--muted);
+        }
+        .type-tag.click { color: var(--accent); border-color: rgba(0,100,210,.4); }
+        .id { font-family: var(--sans); color: var(--ink); }
+        .empty { color: var(--muted); font-family: var(--sans); font-size: 12px; padding: 16px 10px; }
+
+        /* status dots shared with inspector */
+        .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; vertical-align: middle; }
+        .dot.green { background: var(--ok); box-shadow: 0 0 6px rgba(134,184,23,.5); }
+        .dot.red   { background: var(--bad); box-shadow: 0 0 6px rgba(229,50,56,.5); }
+        .dot.amber { background: var(--warn); }
+        .dot.gray  { background: var(--idle); }
+        .step-label { color: var(--ink); }
+
+        /* ---- inspector slide-over ---------------------------------------- */
+        .inspector {
+            position: fixed; top: 0; right: 0; bottom: 0;
+            width: 460px; max-width: 92vw;
+            background: var(--panel);
+            border-left: 1px solid var(--line);
+            box-shadow: -24px 0 60px rgba(0,0,0,.5);
+            padding: 22px; overflow-y: auto;
+            transform: translateX(100%);
+            transition: transform .2s ease-out;
+            z-index: 50;
+        }
+        .inspector.open { transform: translateX(0); }
+        .inspector .close {
+            float: right; cursor: pointer; color: var(--ink);
+            font-size: 20px; line-height: 1; background: var(--panel-2);
+            border: 1px solid var(--line); width: 34px; height: 34px; border-radius: 8px;
+        }
+        .inspector .close:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+        .inspector h2 { font-family: var(--sans); font-size: 18px; letter-spacing: -.2px; margin: 4px 0 16px; word-break: break-all; }
+        .kv { font-family: var(--sans); font-size: 12px; color: var(--ink); margin: 7px 0; }
+        .kv b { color: var(--muted); font-weight: 700; }
+        .steps { margin-top: 18px; border-left: 1px solid var(--line); padding-left: 4px; }
+        .step { padding: 11px 0 11px 16px; position: relative; font-size: 13px; }
+        .step .dot { position: absolute; left: -4px; top: 15px; outline: 3px solid var(--panel); }
+        .step .ts { color: var(--muted); font-family: var(--sans); font-size: 11px; margin-top: 4px; }
+
+        .footer { margin-top: 26px; color: var(--muted); font-family: var(--sans); font-size: 11px; text-align: center; letter-spacing: .04em; }
+        .footer code { background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; color: var(--ink); }
+
+        @media (max-width: 880px) {
+            .hero-foot { grid-template-columns: 1fr 1fr; }
+            .cols { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 640px) {
+            .shell { padding: 0 14px 28px; }
+            .statusbar { grid-template-columns: 1fr auto; }
+            .subtitle { display: none; }
+            .funnel { grid-template-columns: 1fr; }
+            .chev { transform: rotate(90deg); padding: 4px 0; }
+            .hero-foot { grid-template-columns: 1fr; }
+        }
+        /* ---- process visualizations -------------------------------------- */
+        .viz-svg { width: 100%; height: 190px; display: block; }
+        .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-top: 10px; }
+        .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+        .axis-note { font-size: 10px; color: var(--muted); margin-top: 6px; }
+
+        /* backpressure / regime ribbon */
+        .ribbon { display: flex; height: 13px; border-radius: 4px; overflow: hidden; margin-top: 12px; border: 1px solid var(--line); background: var(--panel-2); }
+        .ribbon > span { flex: 1 0 auto; }
+        .ribbon .r-live { background: var(--ok); }
+        .ribbon .r-paused { background: var(--bad); }
+        .ribbon .r-stall { background: var(--warn); }
+
+        /* pipeline schematic */
+        .pipeline { display: flex; align-items: center; gap: 0; flex-wrap: nowrap; overflow-x: auto; padding: 6px 2px 2px; }
+        .node {
+            flex: 0 0 auto; min-width: 118px; background: var(--panel-2);
+            border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; text-align: center;
+            transition: border-color .2s ease, color .2s ease;
+        }
+        .node .nlabel { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; }
+        .node .nval { font-weight: 700; font-size: 19px; font-variant-numeric: tabular-nums; margin-top: 5px; }
+        .node .nsub { font-size: 10px; color: var(--muted); margin-top: 4px; line-height: 1.4; }
+        .node.dlq { border-style: dashed; }
+        body.paused .node.sink { border-color: var(--bad); color: var(--bad); }
+        .edge {
+            flex: 1 1 22px; min-width: 22px; height: 3px; align-self: center; border-radius: 2px;
+            background-image: linear-gradient(90deg, var(--accent) 0 55%, transparent 55% 100%);
+            background-size: 13px 100%; background-repeat: repeat-x;
+            animation: march 0.9s linear infinite; opacity: .9;
+        }
+        .edge.dim { background-image: linear-gradient(90deg, var(--idle) 0 55%, transparent 55% 100%); opacity: .5; animation: none; }
+        @keyframes march { to { background-position: 13px 0; } }
+        body.paused .pipeline .edge { background-image: linear-gradient(90deg, var(--bad) 0 55%, transparent 55% 100%); animation: none; opacity: .55; }
+        /* Join engine forks: one edge to the output sink, one to the dead-letter queue. */
+        .branch { display: flex; flex-direction: column; gap: 12px; flex: 1 1 auto; }
+        .branch-row { display: flex; align-items: center; }
+        .branch-row .edge { flex: 0 0 30px; min-width: 30px; }
+
+        /* horizontal bars: leaderboard + latency histogram */
+        .bars { display: grid; gap: 9px; }
+        .bar-row { display: grid; grid-template-columns: 96px 1fr 56px; gap: 10px; align-items: center; font-size: 12px; }
+        .bar-row .lab { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+        .bar-track { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; height: 18px; overflow: hidden; }
+        .bar-fill { height: 100%; background: var(--accent); border-radius: 6px 0 0 6px; transition: width .4s ease; min-width: 2px; }
+        .bar-row .val { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+        @media (max-width: 880px) { .proc-row, .biz-row { grid-template-columns: 1fr !important; } }
+        @media (prefers-reduced-motion: reduce) {
+            .live-flag .beacon, .chev span, .num.flash { animation: none !important; }
+            .lagbar > i, .row, .bar-fill { transition: none; }
+            .edge { animation: none !important; }
+        }
+    </style>
+</head>
+<body>
+<div class="shell">
+
+<header class="statusbar">
+    <div class="brand">
+        <span class="ebay" aria-label="eBay"><span>e</span><span>b</span><span>a</span><span>y</span></span>
+        <span class="brand-product">Attribution</span>
+    </div>
+    <div class="subtitle">live attribution pipeline — kafka in, output sink out</div>
+    <div class="status-right">
+        <span class="parts" id="part-dots" title="per-partition health"></span>
+        <span id="global-lag">lag —</span>
+        <span class="live-flag"><span class="beacon"></span><span id="last-updated">connecting…</span></span>
+        <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle light/dark theme">
+            <span class="glyph" id="theme-glyph">☾</span><span id="theme-label">dark</span>
+        </button>
+    </div>
+</header>
+
+<div class="alert" id="sink-alert"><span class="sq"></span>Sink paused — backpressure engaged</div>
+<div class="alert skew" id="skew-alert"><span class="sq"></span><span id="skew-text"></span></div>
+
+<!-- HERO: attribution funnel (signature element) -->
+<section class="panel hero">
+    <p class="eyebrow" title="Lifetime funnel since startup: page views consumed, page views attributed, and events dead-lettered.">Attribution flow</p>
+    <div class="funnel">
+        <div class="stage">
+            <div class="label">Page views</div>
+            <div class="num" id="m-pageviews">—</div>
+            <div class="sub">consumed from kafka</div>
+        </div>
+        <div class="chev" aria-hidden="true"><span>›</span><span>›</span><span>›</span></div>
+        <div class="stage attributed">
+            <div class="label">Attributed</div>
+            <div class="num" id="m-attributed">—</div>
+            <div class="sub">joined to a click</div>
+        </div>
+        <div class="chev" aria-hidden="true"><span>›</span><span>›</span><span>›</span></div>
+        <div class="stage dead">
+            <div class="label">Dead-letter</div>
+            <div class="num" id="m-deadletter">—</div>
+            <div class="sub">published to DLQ</div>
+        </div>
+    </div>
+    <div class="hero-foot">
+        <div class="rate-block">
+            <div class="label">Attribution rate</div>
+            <div class="rate-num" id="m-rate">—</div>
+            <svg id="sparkline" viewBox="0 0 300 46" preserveAspectRatio="none" aria-hidden="true"></svg>
+        </div>
+        <div class="ministat">
+            <div class="label">Clicks consumed</div>
+            <div class="v" id="m-clicks">—</div>
+        </div>
+        <div class="ministat">
+            <div class="label">Active click inventory</div>
+            <div class="v" id="m-inventory">—</div>
+        </div>
+    </div>
+</section>
+
+<!-- PIPELINE SCHEMATIC -->
+<section class="panel" style="margin-bottom:22px;">
+    <p class="eyebrow" title="End-to-end stages: Kafka inputs → join engine → Postgres sink, with a side path to the dead-letter topic.">Pipeline</p>
+    <div class="pipeline" id="pipeline">
+        <div class="node"><div class="nlabel">Kafka in</div><div class="nval" id="pl-in">—</div><div class="nsub">clicks + page views /s</div></div>
+        <div class="edge dim" id="pl-in-edge"></div>
+        <div class="node"><div class="nlabel">Join engine</div><div class="nval" id="pl-join">—</div><div class="nsub" id="pl-join-sub">clicks — · lag —</div></div>
+        <div class="branch">
+            <div class="branch-row"><div class="edge dim" id="pl-sink-edge"></div><div class="node sink"><div class="nlabel">Output sink</div><div class="nval" id="pl-sink">—</div><div class="nsub" id="pl-sink-sub">durable sink</div></div></div>
+            <div class="branch-row"><div class="edge dim" id="pl-dlq-edge"></div><div class="node dlq"><div class="nlabel">↘ dead-letter</div><div class="nval" id="pl-dlq">—</div><div class="nsub">too-late → DLQ</div></div></div>
+        </div>
+    </div>
+</section>
+
+<!-- PARTITION RAIL -->
+<section class="panel rail">
+    <p class="eyebrow" title="Per partition: the joined watermark (event-time frontier up to which both streams are seen) and processing staleness.">Partitions · watermark &amp; lag</p>
+    <div class="part-grid" id="part-grid"></div>
+</section>
+
+<!-- PROCESS: skew plot + throughput/ribbon -->
+<div class="cols" style="margin-bottom:22px;">
+    <section class="panel">
+        <p class="eyebrow" title="Seconds since each partition's joined watermark last advanced. Near 0 = actively progressing; a rising line = that partition is idle or stalled.">Processing staleness</p>
+        <svg id="skew-svg" class="viz-svg" viewBox="0 0 600 190" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="axis-note">Y = seconds since each partition's joined watermark last advanced · X = time · lower = fresher. One line per partition.</div>
+        <div class="legend" id="skew-legend"></div>
+    </section>
+    <section class="panel">
+        <p class="eyebrow" title="Per-second consumed / attributed / dead-lettered rates. Highlights when a partition is paused for backpressure.">Throughput &amp; backpressure</p>
+        <svg id="tput-svg" class="viz-svg" viewBox="0 0 600 190" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="ribbon" id="regime-ribbon"></div>
+        <div class="legend">
+            <span><i style="background:var(--accent)"></i>consumed/s</span>
+            <span><i style="background:var(--ok)"></i>attributed/s</span>
+            <span><i style="background:var(--bad)"></i>dead-letter/s</span>
+            <span style="margin-left:auto"><i style="background:var(--bad)"></i>paused <i style="background:var(--warn);margin-left:8px"></i>wm stalled</span>
+        </div>
+    </section>
+</div>
+
+<!-- FEED + TIMELINE -->
+<div class="cols">
+    <section class="panel">
+        <p class="eyebrow" title="Newest consumed events (clicks and page views) with their latest processing step.">Recent stream</p>
+        <div class="scroll">
+            <table>
+                <thead><tr><th>Type</th><th>ID</th><th>User</th><th>Event time</th><th>P</th><th>Latest step</th></tr></thead>
+                <tbody id="events-body"></tbody>
+            </table>
+        </div>
+    </section>
+    <section class="panel">
+        <p class="eyebrow" title="Recent page views that reached an attribution, showing the credited campaign and click.">Attribution timeline</p>
+        <div class="scroll">
+            <table>
+                <thead><tr><th>Page view</th><th>User</th><th>Event time</th><th>Attribution</th></tr></thead>
+                <tbody id="attributions-body"></tbody>
+            </table>
+        </div>
+    </section>
+</div>
+
+<!-- CAMPAIGNS + LATENCY -->
+<div class="cols" style="margin-top:22px;">
+    <section class="panel">
+        <p class="eyebrow" title="Campaigns ranked by credited page views. Reflects initial attribution at write time (later corrections are not re-counted).">Top campaigns by attribution</p>
+        <div class="bars" id="campaigns-bars"></div>
+    </section>
+    <section class="panel">
+        <p class="eyebrow" title="Distribution of wall-clock time from a page view's event_time to when its attributed row was written.">End-to-end latency · event → write</p>
+        <div class="bars" id="latency-bars"></div>
+    </section>
+</div>
+
+<div class="footer">snapshot <code>/api/dashboard</code> · events <code>/api/events/*</code> · campaigns <code>/api/campaigns/top</code> · latency <code>/api/latency/histogram</code> · refresh 2s</div>
+</div>
+
+<aside id="inspector" class="inspector" role="dialog" aria-modal="true" aria-labelledby="inspector-title">
+    <button class="close" onclick="closeInspector()" aria-label="Close inspector">×</button>
+    <h2 id="inspector-title">Event journey</h2>
+    <div id="inspector-meta"></div>
+    <div id="inspector-steps" class="steps"></div>
+</aside>
+
+<script>
+    const fmt = n => (n == null ? '—' : Number(n).toLocaleString());
+    const fmtWm = s => s == null ? '—' : s;
+    const fmtLag = secs => secs == null ? '—' : (secs < 90 ? secs + 's' : Math.round(secs / 60) + 'm');
+    // Human duration across larger magnitudes — used for watermark-ahead skew.
+    const fmtDur = s => s < 90 ? s + 's' : s < 5400 ? Math.round(s / 60) + 'm'
+        : s < 172800 ? Math.round(s / 3600) + 'h' : Math.round(s / 86400) + 'd';
+    const esc = s => (s == null ? '' : String(s).replace(/[&<>"]/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])));
+
+    // Map a step label to a state color — this mapping IS the palette.
+    function dotClass(label) {
+        if (!label) return 'gray';
+        if (label.startsWith('attributed') || label === 'emitted') return 'green';
+        if (label.includes('dropped') || label.includes('dead-letter')) return 'red';
+        if (label.includes('duplicate') || label.includes('no attribution')) return 'amber';
+        return 'gray';
+    }
+
+    // Lag severity: heuristic thresholds, width normalized against a 60s ceiling.
+    function lagSeverity(secs) {
+        if (secs == null) return { cls: 'sev-idle', pct: 0 };
+        // Negative lag = joined watermark sits ahead of wall-clock: a stranded
+        // frontier (future-dated events) that dead-letters later real-time traffic.
+        if (secs < 0) return { cls: 'sev-ahead', pct: 100, ahead: true };
+        const pct = Math.min(100, Math.round((secs / 60) * 100));
+        if (secs < 10) return { cls: 'sev-ok', pct: Math.max(pct, 6) };
+        if (secs < 30) return { cls: 'sev-warn', pct };
+        return { cls: 'sev-bad', pct };
+    }
+
+    // Set a number, flashing the cell when it grows.
+    const lastVals = {};
+    function setNum(id, value) {
+        const el = document.getElementById(id);
+        const text = fmt(value);
+        if (lastVals[id] != null && value > lastVals[id]) {
+            el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+        }
+        lastVals[id] = value;
+        el.textContent = text;
+    }
+
+    // Rolling attribution-rate history for the sparkline (kept in-page).
+    const rateHistory = [];
+    function drawSparkline() {
+        const svg = document.getElementById('sparkline');
+        if (rateHistory.length < 2) { svg.innerHTML = ''; return; }
+        const W = 300, H = 46, pad = 2;
+        const max = 100, min = 0;
+        const pts = rateHistory.map((r, i) => {
+            const x = (i / (rateHistory.length - 1)) * W;
+            const y = H - pad - ((r - min) / (max - min)) * (H - pad * 2);
+            return `${x.toFixed(1)},${y.toFixed(1)}`;
+        });
+        const area = `0,${H} ${pts.join(' ')} ${W},${H}`;
+        svg.innerHTML =
+            `<polygon points="${area}" fill="rgba(0,100,210,0.14)"/>` +
+            `<polyline points="${pts.join(' ')}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
+    }
+
+    // ---- process-visualization state (all derived from the 2s polls) ----
+    const MAXPTS = 120;
+    const skewSeries = {};   // partition -> [stalenessSeconds]  (wall-clock since last watermark advance)
+    const tputHist = [];     // [{consumed, attributed, dead}] per-second rates
+    const regimeHist = [];   // ['live'|'paused'|'stall']
+    let prevCounters = null, prevWall = null, prevMaxWm = null;
+    const PART_COLORS = ['var(--accent)', 'var(--ok)', 'var(--warn)', '#b388ff', '#ff8a65'];
+
+    function parseInstant(s) {
+        if (s == null) return null;
+        const ms = Date.parse(s);
+        return isNaN(ms) ? null : ms;
+    }
+
+    // Processing staleness over time: seconds since each partition's joined watermark
+    // last advanced (>= 0). Bounded + meaningful for historical/backfill data, unlike
+    // event-time-minus-wall-clock which collapses to one off-scale line for old data.
+    function drawSkew(lagByP) {
+        const svg = document.getElementById('skew-svg');
+        Object.entries(lagByP).forEach(([p, secs]) => {
+            if (secs == null) return;  // never-advanced partition: omit rather than plot a misleading 0
+            (skewSeries[p] = skewSeries[p] || []).push(secs);
+            if (skewSeries[p].length > MAXPTS) skewSeries[p].shift();
+        });
+        const all = Object.values(skewSeries).flat();
+        if (all.length < 2) { svg.innerHTML = ''; return; }
+        const W = 600, H = 190, pad = 14;
+        const lo = 0, hi = Math.max(1, ...all);
+        const n = Math.max(...Object.values(skewSeries).map(a => a.length));
+        const sx = i => pad + (n <= 1 ? 0 : (i / (n - 1))) * (W - 2 * pad);
+        const sy = v => H - pad - ((v - lo) / (hi - lo)) * (H - 2 * pad);
+        let out = '';
+        const legend = [];
+        Object.entries(skewSeries).forEach(([p, arr], idx) => {
+            const color = PART_COLORS[idx % PART_COLORS.length];
+            const offset = n - arr.length;
+            const pts = arr.map((v, i) => `${sx(offset + i).toFixed(1)},${sy(v).toFixed(1)}`).join(' ');
+            out += `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.6" vector-effect="non-scaling-stroke"/>`;
+            legend.push(`<span><i style="background:${color}"></i>partition ${p}: ${Math.round(arr[arr.length - 1])}s</span>`);
+        });
+        svg.innerHTML = out;
+        document.getElementById('skew-legend').innerHTML = legend.join('');
+    }
+
+    function drawTput() {
+        const svg = document.getElementById('tput-svg');
+        if (tputHist.length < 2) { svg.innerHTML = ''; return; }
+        const W = 600, H = 190, pad = 10;
+        const maxR = Math.max(1, ...tputHist.flatMap(d => [d.consumed, d.attributed, d.dead]));
+        const n = tputHist.length;
+        const sx = i => pad + (i / (n - 1)) * (W - 2 * pad);
+        const sy = v => H - pad - (v / maxR) * (H - 2 * pad);
+        let out = '';
+        [['consumed', 'var(--accent)'], ['attributed', 'var(--ok)'], ['dead', 'var(--bad)']].forEach(([k, color]) => {
+            const pts = tputHist.map((d, i) => `${sx(i).toFixed(1)},${sy(d[k]).toFixed(1)}`).join(' ');
+            out += `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.6" vector-effect="non-scaling-stroke"/>`;
+        });
+        svg.innerHTML = out;
+    }
+
+    function drawRibbon() {
+        document.getElementById('regime-ribbon').innerHTML =
+            regimeHist.map(r => `<span class="r-${r}"></span>`).join('');
+    }
+
+    function drawBars(elId, rows) {
+        const max = Math.max(1, ...rows.map(r => r.value));
+        document.getElementById(elId).innerHTML = rows.length
+            ? rows.map(r => `<div class="bar-row">
+                    <span class="lab">${esc(r.label)}</span>
+                    <span class="bar-track"><span class="bar-fill" style="width:${Math.round((r.value / max) * 100)}%"></span></span>
+                    <span class="val">${fmt(r.value)}</span>
+                </div>`).join('')
+            : '<div class="empty">No data yet.</div>';
+    }
+
+    function drawSchematic(data, rates) {
+        document.getElementById('pl-in').textContent = rates ? fmt(Math.round(rates.consumed)) + '/s' : '—';
+        document.getElementById('pl-join').textContent = rates ? fmt(Math.round(rates.attributed)) + '/s' : '—';
+        document.getElementById('pl-join-sub').textContent = `clicks ${fmt(data.totalClicks)}`;
+        document.getElementById('pl-sink').textContent = data.sinkPaused ? 'paused' : 'ready';
+        document.getElementById('pl-dlq').textContent = fmt((data.counters || {}).deadLetterPublished);
+        // Edges only animate while their stage is actually flowing (rate > 0);
+        // otherwise they go static/dim rather than blinking with no traffic.
+        const flow = (id, on) => document.getElementById(id).classList.toggle('dim', !on);
+        flow('pl-in-edge', !!rates && rates.consumed > 0);
+        flow('pl-sink-edge', !!rates && rates.attributed > 0);
+        flow('pl-dlq-edge', !!rates && rates.dead > 0);
+    }
+
+    async function refreshSnapshot() {
+        const res = await fetch('/api/dashboard', { cache: 'no-store' });
+        const data = await res.json();
+        const c = data.counters || {};
+
+        document.body.classList.toggle('paused', !!data.sinkPaused);
+
+        setNum('m-pageviews', c.pageViewsConsumed);
+        setNum('m-attributed', c.pageViewsAttributed);
+        setNum('m-deadletter', c.deadLetterPublished);
+        setNum('m-clicks', c.clicksConsumed);
+        setNum('m-inventory', data.totalClicks);
+
+        const consumed = c.pageViewsConsumed || 0;
+        const rate = consumed > 0 ? (c.pageViewsAttributed / consumed) * 100 : null;
+        document.getElementById('m-rate').textContent = rate == null ? '—' : rate.toFixed(1) + '%';
+        if (rate != null) { rateHistory.push(rate); if (rateHistory.length > 60) rateHistory.shift(); drawSparkline(); }
+
+        // Partition rail + header summary.
+        const lag = data.lagSecondsByPartition || {};
+        const wm = data.joinedWatermarkByPartition || {};
+        let worst = -1, aheadMax = 0; const dots = []; const stranded = [];
+        const cards = Object.keys(wm).map(p => {
+            const secs = lag[p];
+            const sev = lagSeverity(secs);
+            if (sev.ahead) {
+                aheadMax = Math.max(aheadMax, -secs);
+                stranded.push(p);
+                dots.push('bad');
+            } else {
+                if (secs != null && secs > worst) worst = secs;
+                dots.push(secs == null ? 'idle' : (secs < 10 ? 'live' : secs < 30 ? 'warn' : 'bad'));
+            }
+            const lagText = sev.ahead ? '▲ ' + fmtDur(-secs) + ' ahead' : fmtLag(secs);
+            return `<div class="part${sev.ahead ? ' stranded' : ''}">
+                <div class="pid"><span>partition <b>${p}</b></span></div>
+                <div class="lagval${sev.ahead ? ' ahead' : ''}">${lagText}</div>
+                <div class="lagbar ${sev.cls}"><i style="width:${sev.pct}%"></i></div>
+                <div class="meta">
+                    <span>wm <b>${esc(fmtWm(wm[p]))}</b></span>
+                </div>
+                ${sev.ahead ? '<div class="skewnote">watermark ahead of wall-clock — late events dead-letter</div>' : ''}
+            </div>`;
+        }).join('');
+        document.getElementById('part-grid').innerHTML = cards;
+        document.getElementById('part-dots').innerHTML =
+            dots.map(d => `<span class="pdot ${d === 'idle' ? '' : d}"></span>`).join('');
+
+        document.body.classList.toggle('stranded', stranded.length > 0);
+        if (stranded.length > 0) {
+            const plural = stranded.length > 1 ? 's' : '';
+            document.getElementById('skew-text').textContent =
+                `Watermark ahead of wall-clock on partition${plural} ${stranded.join(', ')} by up to `
+                + `${fmtDur(aheadMax)} — incoming events dead-letter as "too late" until the frontier `
+                + `recovers (restart the processor).`;
+        }
+        const glag = document.getElementById('global-lag');
+        glag.classList.toggle('crit', stranded.length > 0);
+        glag.textContent = stranded.length > 0
+            ? 'wm +' + fmtDur(aheadMax) + ' ahead'
+            : 'lag ' + (worst < 0 ? '—' : fmtLag(worst));
+
+        // ---- process visualizations (derived from this poll) ------------
+        const nowWall = Date.now();
+        const wmVals = Object.values(wm).map(parseInstant).filter(v => v != null);
+        const maxWm = wmVals.length ? Math.max(...wmVals) : null;
+        let rates = null;
+        if (prevCounters && nowWall > prevWall) {
+            const dt = (nowWall - prevWall) / 1000;
+            const rate = (cur, prev) => Math.max(0, (cur - prev) / dt);
+            rates = {
+                consumed: rate((c.clicksConsumed || 0) + (c.pageViewsConsumed || 0), prevCounters.in),
+                attributed: rate(c.pageViewsAttributed || 0, prevCounters.attr),
+                dead: rate(c.deadLetterPublished || 0, prevCounters.dead),
+            };
+            tputHist.push(rates);
+            if (tputHist.length > MAXPTS) tputHist.shift();
+            const regime = data.sinkPaused ? 'paused'
+                : (prevMaxWm != null && maxWm != null && maxWm <= prevMaxWm) ? 'stall' : 'live';
+            regimeHist.push(regime);
+            if (regimeHist.length > MAXPTS) regimeHist.shift();
+        }
+        prevCounters = {
+            in: (c.clicksConsumed || 0) + (c.pageViewsConsumed || 0),
+            attr: c.pageViewsAttributed || 0,
+            dead: c.deadLetterPublished || 0,
+        };
+        prevWall = nowWall;
+        if (maxWm != null) prevMaxWm = maxWm;
+
+        drawSkew(lag);
+        drawTput();
+        drawRibbon();
+        drawSchematic(data, rates);
+    }
+
+    async function refreshCampaigns() {
+        const res = await fetch('/api/campaigns/top?limit=8', { cache: 'no-store' });
+        if (!res.ok) return;
+        const rows = (await res.json()).map(x => ({ label: x.campaignId, value: x.count }));
+        drawBars('campaigns-bars', rows);
+    }
+
+    async function refreshLatency() {
+        const res = await fetch('/api/latency/histogram', { cache: 'no-store' });
+        if (!res.ok) return;
+        const rows = (await res.json()).map(b => ({ label: b.label, value: b.count }));
+        drawBars('latency-bars', rows);
+    }
+
+    async function refreshEvents() {
+        const res = await fetch('/api/events/recent?limit=50', { cache: 'no-store' });
+        const events = await res.json();
+        document.getElementById('events-body').innerHTML = events.map(e =>
+            `<tr class="row" tabindex="0" onclick="openInspector('${esc(e.id)}')" onkeydown="rowKey(event,'${esc(e.id)}')">
+                <td><span class="type-tag ${e.type === 'AD_CLICK' ? 'click' : ''}">${e.type === 'AD_CLICK' ? 'click' : 'pview'}</span></td>
+                <td class="id">${esc(e.id)}</td>
+                <td class="mono">${esc(e.userId)}</td>
+                <td class="mono">${esc(e.eventTime)}</td>
+                <td class="mono">${e.partition}</td>
+                <td><span class="dot ${dotClass(e.latestStep)}"></span><span class="step-label">${esc(e.latestStep)}</span></td>
+            </tr>`).join('') || '<tr><td colspan="6" class="empty">No events yet.</td></tr>';
+    }
+
+    async function refreshAttributions() {
+        const res = await fetch('/api/events/attributions?limit=50', { cache: 'no-store' });
+        const events = await res.json();
+        document.getElementById('attributions-body').innerHTML = events.map(e =>
+            `<tr class="row" tabindex="0" onclick="openInspector('${esc(e.id)}')" onkeydown="rowKey(event,'${esc(e.id)}')">
+                <td class="id">${esc(e.id)}</td>
+                <td class="mono">${esc(e.userId)}</td>
+                <td class="mono">${esc(e.eventTime)}</td>
+                <td><span class="dot ${dotClass(e.latestStep)}"></span><span class="step-label">${esc(e.latestStep)}</span></td>
+            </tr>`).join('') || '<tr><td colspan="4" class="empty">No attributions yet.</td></tr>';
+    }
+
+    function rowKey(ev, id) {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); openInspector(id); }
+    }
+
+    async function openInspector(id) {
+        const panel = document.getElementById('inspector');
+        const res = await fetch('/api/events/' + encodeURIComponent(id), { cache: 'no-store' });
+        if (!res.ok) {
+            document.getElementById('inspector-title').textContent = 'Event journey';
+            document.getElementById('inspector-meta').innerHTML =
+                `<div class="kv">Event ${esc(id)} is no longer in the recent window.</div>`;
+            document.getElementById('inspector-steps').innerHTML = '';
+            panel.classList.add('open');
+            return;
+        }
+        const t = await res.json();
+        document.getElementById('inspector-title').textContent =
+            (t.type === 'AD_CLICK' ? 'Ad click' : 'Page view') + ' · ' + t.id;
+        document.getElementById('inspector-meta').innerHTML =
+            `<div class="kv"><b>user</b> ${esc(t.userId)}</div>
+             <div class="kv"><b>event time</b> ${esc(t.eventTime)}</div>
+             <div class="kv"><b>partition / offset</b> ${t.partition} / ${t.offset}</div>
+             <div class="kv"><b>first seen</b> ${esc(t.firstSeen)}</div>`;
+        document.getElementById('inspector-steps').innerHTML = (t.steps || []).map(s =>
+            `<div class="step"><span class="dot ${dotClass(s.label)}"></span><span class="step-label">${esc(s.label)}</span>
+                <div class="ts">${esc(s.at)}</div></div>`).join('');
+        panel.classList.add('open');
+    }
+
+    function closeInspector() {
+        document.getElementById('inspector').classList.remove('open');
+    }
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeInspector(); });
+
+    async function refresh() {
+        try {
+            await Promise.all([
+                refreshSnapshot(), refreshEvents(), refreshAttributions(),
+                refreshCampaigns().catch(() => {}), refreshLatency().catch(() => {}),
+            ]);
+            document.getElementById('last-updated').textContent =
+                new Date().toLocaleTimeString();
+        } catch (e) {
+            document.getElementById('last-updated').textContent = 'fetch error';
+        }
+    }
+
+    // Theme: persisted choice wins, else follow the OS preference.
+    function applyTheme(theme) {
+        document.documentElement.dataset.theme = theme;
+        document.getElementById('theme-glyph').textContent = theme === 'light' ? '☀' : '☾';
+        document.getElementById('theme-label').textContent = theme;
+        document.getElementById('theme-toggle')
+            .setAttribute('aria-pressed', theme === 'light');
+    }
+    (function initTheme() {
+        const saved = localStorage.getItem('streamproc-theme');
+        const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+        applyTheme(saved || (prefersLight ? 'light' : 'dark'));
+    })();
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+        const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+        localStorage.setItem('streamproc-theme', next);
+        applyTheme(next);
+    });
+
+    refresh();
+    setInterval(refresh, 2000);
+</script>
+</body>
+</html>
