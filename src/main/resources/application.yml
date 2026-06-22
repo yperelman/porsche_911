@@ -1,3 +1,6 @@
+server:
+  port: 8081
+
 spring:
   application:
     name: stream-processor
@@ -8,18 +11,51 @@ kafka:
   topics:
     page-views: page_views
     ad-clicks: ad_clicks
+    dead-letter: dead_letter
   consumer:
     group-id: stream-processor-group
-    concurrency: 3  # Number of concurrent consumer threads (one per partition)
+    concurrency: 3  # one consumer thread per partition; also drives the NewTopic partition count
 
-# Output Configuration
-output:
-  database:
-    path: ./output/attributed_page_views.db
+# Postgres sink configuration
+postgres:
+  jdbc-url: jdbc:postgresql://postgres:5432/attribution
+  user: streamprocessor
+  password: streamprocessor
 
 # Watermark Configuration
 watermark:
-  allowed-lateness-minutes: 2
+  allowed-lateness-minutes: 2  # README permits up to 15 minutes
+  # Reject events whose event_time is more than this far ahead of wall-clock
+  # (producer clock skew). Without this, one future-dated event advances the
+  # monotonic joined watermark permanently and strands the partition.
+  max-future-skew-minutes: 5
+
+# Attribution window: a page view is attributed to the latest click for the same
+# user whose event_time falls within this many minutes before the page view.
+attribution:
+  window-minutes: 30
+
+# Background maintenance cadence for offset commits, idle-source detection,
+# and the sink health probe that resumes consumption after a backpressure pause
+maintenance:
+  loop:
+    interval-ms: 5000
+
+# Exact partition-scoped backpressure. When a single topic-partition crosses a
+# high watermark, pause only that topic-partition and let Kafka hold backlog.
+# Resume after state drops below the low watermark.
+backpressure:
+  partition:
+    click-state:
+      high: 1000000
+      low: 500000
+
+# Live dashboard event-journey log (backs the live stream, attribution timeline,
+# and event inspector). Bounded ring buffer; disable to remove all hot-path overhead.
+dashboard:
+  event-log:
+    enabled: true
+    capacity: 500
 
 # Logging Configuration
 logging:
