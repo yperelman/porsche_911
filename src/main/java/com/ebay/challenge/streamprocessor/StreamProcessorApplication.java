@@ -3,6 +3,9 @@ package com.ebay.challenge.streamprocessor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+
+import java.time.Clock;
 
 /**
  * Main application for the Real-time Session Attribution Stream Processor.
@@ -18,5 +21,11 @@ public class StreamProcessorApplication {
         log.info("Starting Stream Processor Application...");
         SpringApplication.run(StreamProcessorApplication.class, args);
         log.info("Stream Processor Application started successfully");
+    }
+
+    /** Injectable wall-clock so wall-clock-relative metrics (e.g. dashboard lag) are testable. */
+    @Bean
+    public Clock clock() {
+        return Clock.systemUTC();
     }
 }
