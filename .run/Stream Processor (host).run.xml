@@ -1,0 +1,10 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Stream Processor (host)" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.ebay.challenge.streamprocessor.StreamProcessorApplication" />
+    <module name="stream-processor" />
+    <option name="PROGRAM_PARAMETERS" value="--spring.profiles.active=local" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>
