@@ -1,0 +1,12 @@
+# Host overrides for running the processor from the IDE / host JVM against the
+# Dockerized stack. Activate with --spring.profiles.active=local
+# (IntelliJ: the "Stream Processor (host)" run config sets this automatically).
+#
+# The base application.yml targets the in-container hostnames (kafka:29092,
+# postgres:5432); from the host those don't resolve, so this profile points at
+# the host-mapped ports the broker/Postgres advertise for external clients.
+kafka:
+  bootstrap-servers: localhost:9092
+
+postgres:
+  jdbc-url: jdbc:postgresql://localhost:5433/attribution
