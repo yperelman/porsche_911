@@ -1,5 +1,233 @@
 # Real-time Session Attribution with Windowed Stream Joins
 
+## Implementation Summary
+
+This repository contains a Java 21 / Spring Boot stream processor that consumes `ad_clicks` and `page_views` Kafka topics, joins records by `user_id` in event time, and writes the current attribution result to Postgres table `attributed_page_views`.
+
+The processor uses update-style output: a page view is written immediately with the best click known at arrival time, and later eligible clicks correct the same row with an idempotent Postgres `UPSERT`. The visible sink has one current row per `page_view_id`.
+
+Given the stubs that were given with the project I understood that solutions like Flink for stream processing or Redis for shared state management should not be used here, even though a lot of the complexity of this project could have been resolved by them.
+
+### Prerequisites
+
+- Java 21
+- Maven
+- Docker / Docker Compose
+- Python 3.11+ for the sample data generator
+
+## Product Tradeoff
+
+In a real product, I would first push back on this design. If an ad click opens a page, carrying `campaign_id` and `click_id` through the URL, cookie, or request context is cheaper and more accurate than inferring causality from a time window.
+
+The implemented join assumes that application-level attribution is unavailable. It follows last-touch semantics: each page view independently picks the latest eligible prior click, and a click may be reused for multiple page views. This is deterministic, but it cannot prove true causality when a user clicks multiple ads quickly.
+
+
+### Architecture
+
+- Input topics: `ad_clicks`, `page_views`
+- Dead-letter topic: `dead_letter`
+- Sink: Postgres `attributed_page_views`, keyed by `page_view_id`
+- Join key: `user_id`; both input topics must be co-partitioned by this key
+- Attribution window: latest click where `page_view_time - 30 minutes <= click_time <= page_view_time`
+- Allowed lateness: configurable, capped at 15 minutes by `WatermarkTracker`
+- Output strategy: immediate UPSERT plus correction UPDATEs
+- Offset strategy: page-view offsets become done after durable write; click offsets become done only after watermark-based click eviction, except duplicate logical clicks from a different Kafka source offset may commit after their idempotent correction is flushed
+
+## Join semantics
+
+For each page view, the selected click is the latest click for the same user where:
+
+```text
+page_view_time - 30 minutes <= click_time <= page_view_time
+```
+
+If no click matches at page-view arrival, nullable attribution fields are written. A later accepted click can update that row if it is newer than the row's current `attributed_click_time`; ties use `click_id` ordering for deterministic behavior.
+
+Clicks are stored in memory by `(user_id, event_time, click_id)`. The retained state entry's Kafka `(partition, offset)` remains replayable until watermark eviction. Duplicate or retried clicks still re-run the database correction. A retry from the retained source offset stays uncommitted; a duplicate logical click from a different source offset may become done after that correction is flushed because the retained offset still protects restart recovery.
+
+
+### Watermarks and late data
+
+Watermarks are tracked per `(topic, partition)`. The joined watermark for numeric partition `P` is the monotonic minimum of `ad_clicks-P` and `page_views-P`, excluding only sources that Spring Kafka reports as idle, caught up to broker end offset, and unpaused.
+
+Events at or before `joinedWatermark - allowedLateness` are synchronously written to the `dead_letter` topic and then marked commit-safe. Paused or backlogged partitions are never treated as idle, so backlog is not silently discarded as late.
+
+## Output and delivery guarantees
+
+The processor provides at-least-once processing with idempotent visible Postgres output.
+
+Postgres table `attributed_page_views` is keyed by the composite primary key `(page_view_id, user_id)` — `page_view_id` is not guaranteed globally unique, so user_id is part of the identity. Page-view writes use UPSERT on that key. Click corrections use a guarded set-based `UPDATE` over rows where `click_time <= page_view_time <= click_time + 30 minutes` and only apply when the click wins latest-click ordering.
+
+The guarantee is at-least-once processing with idempotent visible output:
+
+| Failure | Outcome |
+|---|---|
+| Crash before Postgres flush | Transaction rolls back; source offsets stay uncommitted; records replay. |
+| Crash after page-view flush | Row is durable and page-view offset may commit; recovery relies on Postgres durability. |
+| Crash before click eviction | Click offset replays; correction UPDATE is reapplied idempotently. |
+| Click correction flush fails, then record retries | Retry re-runs correction and flushes again before the retained click source offset can commit. |
+| Duplicate logical click arrives at another Kafka offset | Correction is re-run and flushed; that duplicate offset may commit because the retained source offset still replays the click after restart. |
+| Dead-letter publish succeeds but source offset does not commit | Late event may be published again after replay; deterministic source key enables dedupe/compaction. |
+| Offset acknowledgement fails | Tracker retains the safe prefix and retries acknowledgement on the next maintenance cycle. |
+
+The critical ordering is:
+
+```text
+durable Postgres/DLQ output -> mark offset done -> Kafka acknowledgement succeeds -> remove tracker entries
+```
+
+### Concurrency model
+
+Spring Kafka runs concurrent listeners. Both topics for the same numeric partition are serialized through one partition lock before touching join state or that partition's Postgres sink. Different partitions run in parallel, and each partition has its own sink connection.
+
+## Partitioning and Horizontal Scaling
+
+### Co-partitioning requirement
+The join key is `user_id`. Both topics must have the same partition count.
+`hash(user_id) % N` must yield the same partition number in both topics.
+If partition counts differ, a user's click and page view land on different
+partitions — the processor never sees both together — attribution is silently
+lost.
+
+### Click state: in-memory vs. shared store
+
+| Approach | Pros | Cons |
+|---|---|---|
+| In-memory per partition | Zero lookup latency. No extra infra. | Cannot scale horizontally — any instance can only serve its assigned partitions. |
+| Shared store (Redis, DB) | Any instance can read any partition's clicks. Horizontal scaling is trivial — add instances, Kafka rebalances partitions. | Extra network hop per lookup. More infra to operate. |
+
+This project's `ClickStateStore` stub provided manages clicks in memory per partition, therefor an in mem solution was selected.
+
+### Scaling up (adding partitions)
+
+Expanding partitions changes `N` in `hash(user_id) % N`, remapping every user.
+The processor requires strict co-partitioning, so expansion requires a
+controlled migration:
+
+1. Choose a new partition count. Both topics must use the same number.
+2. Producers must start producing to the new topics with the new count.
+   Migration options:
+   - **Dual-write:** producers write to both old and new topics, then the
+     old topics are drained after confirmation that all producers switched.
+     Expect duplicate events on the new topics — the correction UPDATE and
+     the sink's idempotent UPSERT handle these.
+   - **Parallel clusters:** run a second cluster with the new topics and
+     the new processor config. Cut traffic after validation.
+3. Let the processor drain the old topics — verify via dashboard that the
+   joined watermark has advanced and no uncommitted offsets remain.
+4. Update `kafka.consumer.concurrency` and topic names in `application.yml`.
+5. Restart the processor against the new topics.
+
+### Recommendation
+Pick partition count upfront: `max(expected_instances × 3, 12)`.
+Over-partitioning costs little (one JDBC connection per partition).
+Under-partitioning requires the migration above. The default of 3 partitions
+is fine for this demo.
+
+
+## Offset strategy
+
+`OffsetCommitTracker` records every consumed source offset and marks it done only after its work is durable. `OffsetCommitScheduler` periodically prepares the highest contiguous done prefix for each topic-partition. Preparation is non-destructive; entries are removed only after the acknowledgement action succeeds.
+
+Page-view offsets are marked done after their UPSERT is flushed. Retained click source offsets are marked done when click state is evicted after the attribution window plus lateness. This keeps clicks replayable long enough to rebuild state and reapply corrections after a restart.
+
+Duplicate click handling intentionally distinguishes source offsets. `ClickStateStore.isDuplicateFromDifferentSourceOffset(...)` returns true only when the incoming record has the same logical click key as a retained click but a different Kafka `(partition, offset)`. That predicate allows the duplicate offset to commit without committing the retained source offset early.
+
+## Concurrency and state
+
+The Kafka topics must be co-partitioned by `user_id`. Spring Kafka runs concurrent listeners, and `StreamConsumer` serializes both topics for the same numeric partition through a partition lock. Different partitions can process in parallel.
+
+Each numeric partition has its own Postgres sink connection. Click state is partition-scoped for eviction and backpressure. State size is approximately:
+
+```text
+click_rate * (30 minutes + allowed_lateness)
+```
+
+When click state for a partition crosses the high watermark, only that `ad_clicks-P` partition is paused. It resumes after state drops below the low watermark. Postgres failures use a separate global pause and health probe.
+
+## Tests
+
+The suite covers latest-click attribution, out-of-order correction, late-event dead letters, retry after click correction flush failure, duplicate handling, non-destructive offset acknowledgement retry, Kafka-aware watermark idleness, restart behavior, concurrent partition sink isolation, backpressure behavior, and dashboard metrics.
+
+### Run
+
+Two ways to run. Both expose the dashboard at `http://localhost:8081/dashboard.html`
+and Kafka UI at `http://localhost:8080`.
+
+#### Option A — everything in Docker (recommended)
+
+Builds the processor image and runs it alongside Kafka and Postgres on the compose network:
+
+```bash
+docker compose up -d --build
+```
+
+The `app` service waits for Kafka and Postgres to be healthy, then starts. It uses the
+in-container hostnames (`kafka:29092`, `postgres:5432`) from the base `application.yml` —
+no extra configuration. Tail it with:
+
+```bash
+docker compose logs -f app
+```
+
+#### Option B — processor on the host (for IDE / fast iteration)
+
+Start only the infrastructure in Docker, run the processor from the host JVM:
+
+```bash
+docker compose up -d zookeeper kafka kafka-ui postgres
+mvn spring-boot:run -Dspring-boot.run.profiles=local
+```
+
+The `local` profile points the processor at the host-mapped ports (`localhost:9092`,
+`localhost:5433`). Do not run Option A and Option B at the same time — both bind host port 8081.
+
+#### Generate sample data
+
+```bash
+python data_generator.py        # deterministic edge-case dataset
+./stress-test.sh                # high-rate load test (stack + processor must be up)
+```
+
+Ports: dashboard `8081`, Kafka UI `8080`, Kafka `9092` (host) / `29092` (in-network),
+Postgres `5433` (host) / `5432` (in-network).
+
+### Verification
+
+Run the test suite:
+
+```bash
+mvn test
+```
+
+Tests using Testcontainers require Docker socket access. If Docker API compatibility is needed:
+
+```bash
+sg docker -c 'mvn clean test -Dapi.version=1.40'
+```
+
+Inspect attributed output:
+
+```bash
+psql -h localhost -p 5433 -U streamprocessor -d attribution -c 'SELECT * FROM attributed_page_views ORDER BY page_view_id'
+```
+
+Inspect late-event dead letters:
+
+```bash
+docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:29092 --topic dead_letter --from-beginning
+```
+
+Run the stress test after the stack and processor are up:
+
+```bash
+./load-test.sh
+```
+
+Detailed design notes are in [`DESIGN.md`](DESIGN.md) and [`documentation.md`](documentation.md).
+
+---
+
 ## Welcome!
 
 You have received your first challenge to become a part of an awesome team!
