@@ -1,16 +1,21 @@
 services:
-  # Development container
-  dev:
+  # Stream processor application — built from the repo Dockerfile and run inside
+  # the compose network. Uses the base application.yml (kafka:29092, postgres:5432),
+  # so no host-port overrides are needed here.
+  app:
     build:
-      context: .devcontainer
+      context: .
       dockerfile: Dockerfile
-    volumes:
-      - .:/workspace:cached
-    command: sleep infinity
+    container_name: stream-processor
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8081"   # dashboard + REST (stop the IDE-run app first to avoid a clash)
     networks:
       - challenge-network
-    depends_on:
-      - kafka
 
   # Zookeeper - required for Kafka
   zookeeper:
@@ -34,6 +39,7 @@ services:
       - zookeeper
     ports:
       - "9092:9092"
+      - "29092:29092"
       - "9101:9101"
     environment:
       KAFKA_BROKER_ID: 1
@@ -55,6 +61,29 @@ services:
       timeout: 10s
       retries: 5
 
+  # Postgres for the attribution sink.
+  # Mapped to host port 5433 to avoid colliding with other Postgres instances
+  # that may already be running on the developer's machine.
+  postgres:
+    image: postgres:16
+    hostname: postgres
+    container_name: postgres
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: streamprocessor
+      POSTGRES_PASSWORD: streamprocessor
+      POSTGRES_DB: attribution
+    volumes:
+      - postgres-data:/var/lib/postgresql/data3
+    networks:
+      - challenge-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streamprocessor -d attribution"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # Kafka UI for debugging (optional)
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -73,3 +102,6 @@ services:
 networks:
   challenge-network:
     driver: bridge
+
+volumes:
+  postgres-data:
